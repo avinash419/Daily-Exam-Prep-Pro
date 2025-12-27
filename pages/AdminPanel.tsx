@@ -4,27 +4,20 @@ import { useApp } from '../store';
 import { Difficulty, Question } from '../types';
 import { GoogleGenAI, Type } from "@google/genai";
 
-interface IngestionSummary {
-  totalDetected: number;
-  accepted: number;
-  rejected: number;
-  reasons: { raw: string; reason: string }[];
+interface FailedBatch {
+  chunkIndex: number;
+  rawText: string;
+  error: string;
 }
 
 const AdminPanel: React.FC = () => {
   const { questions, addQuestion, deleteQuestion, subjects } = useApp();
-  const [activeTab, setActiveTab] = useState<'manual' | 'hindi'>('manual');
-  const [isBulkMode, setIsBulkMode] = useState(false);
-  const [isScanning, setIsScanning] = useState(false);
+  const [activeTab, setActiveTab] = useState<'manual' | 'bulk' | 'pdf'>('manual');
   const [isProcessing, setIsProcessing] = useState(false);
-  const [batchProgress, setBatchProgress] = useState({ current: 0, total: 0 });
-  const [hindiError, setHindiError] = useState<string | null>(null);
-  
-  const [ingestionSummary, setIngestionSummary] = useState<IngestionSummary | null>(null);
-  const [extractedQuestions, setExtractedQuestions] = useState<Omit<Question, 'id'>[]>([]);
-
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [batchProgress, setBatchProgress] = useState({ current: 0, total: 0, saved: 0 });
+  const [failedBatches, setFailedBatches] = useState<FailedBatch[]>([]);
+  const [adminError, setAdminError] = useState<string | null>(null);
+  const [pdfFile, setPdfFile] = useState<File | null>(null);
 
   const [formData, setFormData] = useState<Omit<Question, 'id'>>({
     examName: 'UP Police Computer Operator',
@@ -39,51 +32,43 @@ const AdminPanel: React.FC = () => {
     source: ''
   });
 
-  const containsUnicodeHindi = (text: string) => /[\u0900-\u097F]/.test(text);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const chunkInputText = (text: string): string[] => {
-    const splitRegex = /\n(?=(?:[Qq]\d+[\.\)\s]|\d+[\.\)\s]))/;
-    const segments = text.split(splitRegex).filter(s => s.trim().length > 0);
-    
-    const chunks: string[] = [];
-    const chunkSize = 12; // Slightly smaller chunks for production stability
-    for (let i = 0; i < segments.length; i += chunkSize) {
-      chunks.push(segments.slice(i, i + chunkSize).join('\n\n'));
-    }
-    return chunks.length === 0 && text.trim().length > 0 ? [text] : chunks;
+  const wait = (ms: number) => new Promise(res => setTimeout(res, ms));
+
+  const fileToBase64 = (file: File): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.readAsDataURL(file);
+      reader.onload = () => {
+        const base64String = (reader.result as string).split(',')[1];
+        resolve(base64String);
+      };
+      reader.onerror = error => reject(error);
+    });
   };
 
-  const handleBulkIngestHindi = async () => {
-    if (!formData.questionText) {
-      alert("Please paste the raw Hindi questions text first.");
+  const handlePDFIngest = async () => {
+    if (!pdfFile) {
+      alert("Please select a PDF file first.");
       return;
     }
 
-    const chunks = chunkInputText(formData.questionText);
     setIsProcessing(true);
-    setBatchProgress({ current: 0, total: chunks.length });
-    setHindiError(null);
-    setIngestionSummary(null);
-    
-    let allValid: any[] = [];
-    let allRejected: any[] = [];
+    setAdminError(null);
+    setBatchProgress({ current: 1, total: 1, saved: 0 });
 
     try {
       const apiKey = process.env.API_KEY;
-      if (!apiKey) {
-        throw new Error("API_KEY is missing. Please configure it in Netlify Environment Variables.");
-      }
+      if (!apiKey) throw new Error("API_KEY missing in environment.");
 
+      const base64Data = await fileToBase64(pdfFile);
       const ai = new GoogleGenAI({ apiKey });
-      
-      const systemPrompt = `You are a bulk question ingestion assistant.
-      Task: Convert legacy fonts to Unicode Hindi. Extract Question, Options A-D, Answer, Explanation, and Difficulty.
-      Current Metadata: Exam: ${formData.examName}, Subject: ${formData.subject}, Topic: ${formData.topic || 'Bulk Ingest'}`;
 
       const schema = {
         type: Type.OBJECT,
         properties: {
-          validQuestions: {
+          questions: {
             type: Type.ARRAY,
             items: {
               type: Type.OBJECT,
@@ -97,341 +82,332 @@ const AdminPanel: React.FC = () => {
                 explanation: { type: Type.STRING },
                 difficulty: { type: Type.STRING, enum: ["Easy", "Medium", "Hard"] }
               },
-              required: ["questionText", "A", "B", "C", "D", "correctAnswer", "difficulty"]
-            }
-          },
-          rejected: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                rawSnippet: { type: Type.STRING },
-                reason: { type: Type.STRING }
-              }
+              required: ["questionText", "A", "B", "C", "D", "correctAnswer"]
             }
           }
         },
-        required: ["validQuestions", "rejected"]
+        required: ["questions"]
       };
 
-      for (let i = 0; i < chunks.length; i++) {
-        setBatchProgress({ current: i + 1, total: chunks.length });
-        
-        // Add a small 500ms delay between batches to prevent triggering production rate limits/WAFs
-        if (i > 0) await new Promise(r => setTimeout(r, 500));
-
-        const result = await ai.models.generateContent({
-          model: 'gemini-3-flash-preview',
-          contents: `Process this batch (#${i+1}/${chunks.length}):\n\n${chunks[i]}`,
-          config: {
-            systemInstruction: systemPrompt,
-            responseMimeType: "application/json",
-            responseSchema: schema
+      const response = await ai.models.generateContent({
+        model: 'gemini-3-flash-preview',
+        contents: [
+          {
+            inlineData: {
+              data: base64Data,
+              mimeType: 'application/pdf'
+            }
+          },
+          {
+            text: `EXTRACT QUESTIONS FROM THIS PDF. 
+            - Convert all Hindi text to Unicode.
+            - Assign Metadata: Exam: ${formData.examName}, Subject: ${formData.subject}.
+            - Output as JSON following the schema.`
           }
-        });
+        ],
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: schema
+        }
+      });
 
-        if (!result.text) throw new Error(`Empty response from AI for batch ${i+1}`);
+      const data = JSON.parse(response.text || '{"questions":[]}');
+      let savedCount = 0;
 
-        const parsed = JSON.parse(result.text);
-        
-        if (parsed.validQuestions) {
-          const processed = parsed.validQuestions.map((q: any) => ({
-            ...q,
+      if (data.questions && data.questions.length > 0) {
+        data.questions.forEach((q: any) => {
+          addQuestion({
             examName: formData.examName,
             subject: formData.subject,
-            topic: formData.topic || 'Bulk Ingest',
+            topic: formData.topic || 'PDF Extraction',
+            difficulty: q.difficulty || Difficulty.MEDIUM,
+            questionText: q.questionText,
             options: { A: q.A, B: q.B, C: q.C, D: q.D },
+            correctAnswer: q.correctAnswer as any,
+            explanation: q.explanation || '',
             year: '2024',
-            source: 'Bulk Paste'
-          }));
-          allValid = [...allValid, ...processed];
-        }
-        
-        if (parsed.rejected) {
-          allRejected = [...allRejected, ...parsed.rejected];
-        }
+            source: pdfFile.name
+          });
+          savedCount++;
+        });
+        setBatchProgress(prev => ({ ...prev, saved: savedCount }));
+        alert(`Successfully imported ${savedCount} questions from PDF!`);
+        setPdfFile(null);
+      } else {
+        throw new Error("No questions could be extracted from this document.");
       }
 
-      setExtractedQuestions(allValid);
-      setIngestionSummary({
-        totalDetected: allValid.length + allRejected.length,
-        accepted: allValid.length,
-        rejected: allRejected.length,
-        reasons: allRejected.map((r: any) => ({ raw: r.rawSnippet, reason: r.reason }))
-      });
-      
     } catch (error: any) {
-      console.error("Bulk Ingestion Error:", error);
-      let errorMsg = "An unexpected error occurred.";
-      
-      if (error.message?.includes("API_KEY")) {
-        errorMsg = "API Key not found in production environment.";
-      } else if (error.message?.includes("401")) {
-        errorMsg = "Invalid API Key. Please check your credentials.";
-      } else if (error.message?.includes("429")) {
-        errorMsg = "Rate limit exceeded. Try again in a few minutes.";
-      } else if (error.name === "SyntaxError") {
-        errorMsg = "AI returned malformed data. Try processing a smaller block.";
-      }
-      
-      setHindiError(`❌ Error: ${errorMsg}`);
-      alert(errorMsg);
+      console.error("PDF Extraction Error:", error);
+      setAdminError(`❌ PDF Error: ${error.message || "Failed to parse document"}`);
     } finally {
       setIsProcessing(false);
     }
   };
 
-  const importSingle = (idx: number) => {
-    addQuestion(extractedQuestions[idx]);
-    setExtractedQuestions(prev => prev.filter((_, i) => i !== idx));
-  };
+  const handleBulkIngestHindi = async () => {
+    if (!formData.questionText.trim()) {
+      alert("Please provide text.");
+      return;
+    }
 
-  const importAll = () => {
-    extractedQuestions.forEach(q => addQuestion(q));
-    setExtractedQuestions([]);
-    setIngestionSummary(null);
-    setFormData({ ...formData, questionText: '', options: { A: '', B: '', C: '', D: '' }, explanation: '' });
-    setHindiError(null);
-    alert("Bulk import complete!");
+    const chunks = formData.questionText.split('\n\n').filter(c => c.trim().length > 10);
+    setIsProcessing(true);
+    setFailedBatches([]);
+    setBatchProgress({ current: 0, total: chunks.length, saved: 0 });
+
+    const apiKey = process.env.API_KEY;
+    if (!apiKey) {
+      setAdminError("❌ API_KEY missing.");
+      setIsProcessing(false);
+      return;
+    }
+
+    const ai = new GoogleGenAI({ apiKey });
+    const schema = {
+      type: Type.OBJECT,
+      properties: {
+        questions: {
+          type: Type.ARRAY,
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              questionText: { type: Type.STRING },
+              A: { type: Type.STRING },
+              B: { type: Type.STRING },
+              C: { type: Type.STRING },
+              D: { type: Type.STRING },
+              correctAnswer: { type: Type.STRING, enum: ["A", "B", "C", "D"] },
+              explanation: { type: Type.STRING },
+              difficulty: { type: Type.STRING, enum: ["Easy", "Medium", "Hard"] }
+            },
+            required: ["questionText", "A", "B", "C", "D", "correctAnswer"]
+          }
+        }
+      },
+      required: ["questions"]
+    };
+
+    let totalSaved = 0;
+    for (let i = 0; i < chunks.length; i++) {
+      setBatchProgress(prev => ({ ...prev, current: i + 1 }));
+      try {
+        const response = await ai.models.generateContent({
+          model: 'gemini-3-flash-preview',
+          contents: `Ingest these questions:\n${chunks[i]}`,
+          config: { responseMimeType: "application/json", responseSchema: schema }
+        });
+        const data = JSON.parse(response.text || '{"questions":[]}');
+        data.questions?.forEach((q: any) => {
+          addQuestion({ ...formData, ...q, options: { A: q.A, B: q.B, C: q.C, D: q.D } });
+          totalSaved++;
+        });
+        setBatchProgress(prev => ({ ...prev, saved: totalSaved }));
+        await wait(500);
+      } catch (err: any) {
+        setFailedBatches(p => [...p, { chunkIndex: i + 1, rawText: chunks[i].slice(0, 50), error: err.message }]);
+      }
+    }
+    setIsProcessing(false);
   };
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (activeTab === 'hindi' && !isBulkMode) {
-      if (!containsUnicodeHindi(formData.questionText)) {
-        setHindiError("⚠️ Invalid Hindi font detected. Please use proper Unicode Hindi.");
-        return;
-      }
-    }
     addQuestion(formData);
     setFormData({ ...formData, questionText: '', explanation: '', options: { A: '', B: '', C: '', D: '' } });
-    setHindiError(null);
     alert("Question saved!");
   };
 
-  const startCamera = async () => {
-    setIsScanning(true);
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
-      if (videoRef.current) videoRef.current.srcObject = stream;
-    } catch (err) {
-      alert("Camera access denied.");
-      setIsScanning(false);
-    }
-  };
-
-  const capturePhoto = () => {
-    if (videoRef.current && canvasRef.current) {
-      const ctx = canvasRef.current.getContext('2d');
-      canvasRef.current.width = videoRef.current.videoWidth;
-      canvasRef.current.height = videoRef.current.videoHeight;
-      ctx?.drawImage(videoRef.current, 0, 0);
-      const stream = videoRef.current.srcObject as MediaStream;
-      stream.getTracks().forEach(track => track.stop());
-      setIsScanning(false);
-    }
-  };
-
   return (
-    <div className="space-y-12 pb-24 max-w-7xl mx-auto">
-      <div className="flex flex-col xl:flex-row justify-between items-start xl:items-center gap-8 bg-white p-10 rounded-[3rem] shadow-xl border border-slate-100">
-        <div className="space-y-2">
-          <h1 className="text-4xl font-black text-slate-900 tracking-tight flex items-center gap-3">
-            <svg className="w-10 h-10 text-indigo-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" /></svg>
-            Question Ingestion
-          </h1>
-          <p className="text-slate-500 font-medium text-lg">Production-ready AI structure for Hindi bank.</p>
+    <div className="space-y-12 pb-24 max-w-7xl mx-auto animate-in fade-in duration-500">
+      <div className="flex flex-col md:flex-row justify-between items-center gap-8 bg-white p-10 rounded-[3rem] shadow-xl border border-slate-100">
+        <div>
+          <h1 className="text-4xl font-black text-slate-900 tracking-tight">Admin Control</h1>
+          <p className="text-slate-500 font-bold">Manage questions and sync document banks</p>
         </div>
-        
-        <div className="flex flex-wrap items-center gap-4">
-          <button
-            onClick={() => { setActiveTab('hindi'); setIsBulkMode(false); }}
-            className={`flex items-center gap-3 px-8 py-5 rounded-[2rem] font-black text-sm shadow-xl transition-all hover:-translate-y-1 ${activeTab === 'hindi' && !isBulkMode ? 'bg-orange-500 text-white' : 'bg-orange-50 text-orange-600'}`}
-          >
-            ➕ Build Hindi Question
-          </button>
-          <button
-            onClick={startCamera}
-            className="flex items-center gap-3 px-8 py-5 bg-blue-600 text-white rounded-[2rem] font-black text-sm shadow-xl hover:bg-blue-700 transition-all hover:-translate-y-1"
-          >
-            <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" /></svg>
-            Live Scan
-          </button>
+        <div className="flex p-1.5 bg-slate-100 rounded-3xl">
+          <button onClick={() => setActiveTab('manual')} className={`px-8 py-3 rounded-2xl font-black text-xs transition-all ${activeTab === 'manual' ? 'bg-white shadow-sm text-slate-900' : 'text-slate-400 hover:text-slate-600'}`}>Manual</button>
+          <button onClick={() => setActiveTab('bulk')} className={`px-8 py-3 rounded-2xl font-black text-xs transition-all ${activeTab === 'bulk' ? 'bg-white shadow-sm text-slate-900' : 'text-slate-400 hover:text-slate-600'}`}>Bulk Text</button>
+          <button onClick={() => setActiveTab('pdf')} className={`px-8 py-3 rounded-2xl font-black text-xs transition-all ${activeTab === 'pdf' ? 'bg-white shadow-sm text-slate-900' : 'text-slate-400 hover:text-slate-600'}`}>PDF Smart</button>
         </div>
       </div>
 
-      {isScanning && (
-        <div className="fixed inset-0 z-[180] bg-black flex flex-col">
-          <video ref={videoRef} autoPlay playsInline className="flex-1 object-contain" />
-          <canvas ref={canvasRef} className="hidden" />
-          <div className="p-16 flex justify-center bg-slate-900">
-            <button onClick={capturePhoto} className="w-24 h-24 bg-white rounded-full border-[8px] border-slate-300"></button>
-            <button onClick={() => setIsScanning(false)} className="absolute right-10 top-10 text-white font-black">CLOSE</button>
-          </div>
-        </div>
-      )}
-
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-12">
-        <div className="lg:col-span-8 space-y-10">
-          <div className="bg-white p-14 rounded-[4rem] border border-slate-100 shadow-2xl space-y-10 relative overflow-hidden">
-             <div className="absolute top-0 inset-x-0 h-2 bg-gradient-to-r from-orange-400 to-red-600"></div>
+        <div className="lg:col-span-8 space-y-8">
+          <div className="bg-white p-12 rounded-[4rem] border border-slate-100 shadow-2xl space-y-10 relative overflow-hidden">
+             <div className="absolute top-0 inset-x-0 h-2 bg-gradient-to-r from-blue-500 via-indigo-500 to-purple-600"></div>
              
-             <div className="flex flex-col md:flex-row md:items-center justify-between gap-6">
-                <div>
-                   <h2 className="text-3xl font-black text-slate-900 tracking-tight">Hindi Question Builder</h2>
-                   <p className="text-slate-500 font-bold">Resilient Production Ingestion</p>
-                </div>
-                <div className="flex p-1.5 bg-slate-100 rounded-2xl">
-                   <button 
-                    onClick={() => { setIsBulkMode(false); setIngestionSummary(null); setExtractedQuestions([]); }}
-                    className={`px-6 py-3 rounded-xl font-black text-xs transition-all ${!isBulkMode ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-400 hover:text-slate-600'}`}
-                   >
-                     Single Entry
-                   </button>
-                   <button 
-                    onClick={() => { setIsBulkMode(true); setHindiError(null); }}
-                    className={`px-6 py-3 rounded-xl font-black text-xs transition-all ${isBulkMode ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-400 hover:text-slate-600'}`}
-                   >
-                     Bulk Ingestion (AI)
-                   </button>
-                </div>
-             </div>
-
-             {hindiError && (
-               <div className={`p-6 border-2 rounded-3xl font-bold flex items-center gap-4 animate-in fade-in slide-in-from-top-4 ${hindiError.startsWith('✨') ? 'bg-emerald-50 border-emerald-100 text-emerald-700' : 'bg-rose-50 border-rose-100 text-rose-700'}`}>
+             {adminError && (
+               <div className="p-6 bg-rose-50 border-2 border-rose-100 rounded-3xl text-rose-700 font-bold flex items-center gap-4 animate-in slide-in-from-top-4">
                  <svg className="w-6 h-6" fill="currentColor" viewBox="0 0 20 20"><path d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" /></svg>
-                 {hindiError}
+                 {adminError}
                </div>
              )}
 
-             <form onSubmit={handleSubmit} className="space-y-10">
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
-                   <div className="space-y-3">
-                     <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Examination</label>
-                     <select className="w-full p-5 bg-slate-50 rounded-2xl border-2 border-slate-100 font-black text-slate-900" value={formData.examName} onChange={e => setFormData({...formData, examName: e.target.value})}>
-                        <option>UP Police Computer Operator</option>
-                        <option>Homeguard</option>
-                        <option>RRB Group D</option>
-                     </select>
-                   </div>
-                   <div className="space-y-3">
-                     <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Subject</label>
-                     <select className="w-full p-5 bg-slate-50 rounded-2xl border-2 border-slate-100 font-black text-slate-900" value={formData.subject} onChange={e => setFormData({...formData, subject: e.target.value})}>
-                        {subjects.map(s => <option key={s.id} value={s.name}>{s.name}</option>)}
-                     </select>
-                   </div>
+             <div className="grid grid-cols-2 gap-6">
+                <div className="space-y-2">
+                  <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Target Exam</label>
+                  <select className="w-full p-5 bg-slate-50 rounded-2xl border-2 border-slate-100 font-black text-slate-900" value={formData.examName} onChange={e => setFormData({...formData, examName: e.target.value})}>
+                     <option>UP Police Computer Operator</option>
+                     <option>Homeguard</option>
+                     <option>RRB Group D</option>
+                  </select>
                 </div>
-
-                <div className="space-y-3">
-                  <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">
-                    {isBulkMode ? 'Bulk Text Paste' : 'Question Text'}
-                  </label>
-                  <textarea 
-                    required 
-                    className="w-full p-8 bg-slate-50 rounded-[2.5rem] border-2 border-slate-100 font-bold text-slate-900 h-64 text-xl outline-none focus:border-orange-500 transition-colors"
-                    placeholder={isBulkMode ? "Paste multiple questions here..." : "यहाँ हिंदी प्रश्न टाइप करें..."}
-                    value={formData.questionText}
-                    onChange={e => { setFormData({...formData, questionText: e.target.value}); setHindiError(null); }}
-                  />
+                <div className="space-y-2">
+                  <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Subject Category</label>
+                  <select className="w-full p-5 bg-slate-50 rounded-2xl border-2 border-slate-100 font-black text-slate-900" value={formData.subject} onChange={e => setFormData({...formData, subject: e.target.value})}>
+                     {subjects.map(s => <option key={s.id} value={s.name}>{s.name}</option>)}
+                  </select>
                 </div>
+             </div>
 
-                {!isBulkMode && (
-                  <>
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                      {['A', 'B', 'C', 'D'].map(opt => (
-                        <div key={opt} className="relative">
-                          <span className="absolute left-6 top-1/2 -translate-y-1/2 w-8 h-8 rounded-lg bg-white border border-slate-100 flex items-center justify-center font-black text-slate-400 text-xs">{opt}</span>
-                          <input required type="text" className="w-full pl-16 p-5 bg-slate-50 rounded-2xl border-2 border-slate-100 font-bold text-slate-900" placeholder={`Option ${opt}`} value={formData.options[opt as keyof typeof formData.options]} onChange={e => setFormData({...formData, options: {...formData.options, [opt]: e.target.value}})} />
-                        </div>
-                      ))}
+             {activeTab === 'manual' && (
+               <form onSubmit={handleSubmit} className="space-y-8 animate-in fade-in">
+                  <div className="space-y-2">
+                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Question Content</label>
+                    <textarea 
+                      required
+                      className="w-full p-8 bg-slate-50 rounded-[2.5rem] border-2 border-slate-100 font-bold h-48 outline-none focus:border-blue-500 transition-colors"
+                      placeholder="Type question text here..."
+                      value={formData.questionText}
+                      onChange={e => setFormData({...formData, questionText: e.target.value})}
+                    />
+                  </div>
+                  <div className="grid grid-cols-2 gap-4">
+                    {['A', 'B', 'C', 'D'].map(opt => (
+                      <input key={opt} required type="text" className="p-5 bg-slate-50 rounded-2xl border-2 border-slate-100 font-bold" placeholder={`Option ${opt}`} value={formData.options[opt as keyof typeof formData.options]} onChange={e => setFormData({...formData, options: {...formData.options, [opt]: e.target.value}})} />
+                    ))}
+                  </div>
+                  <button type="submit" className="w-full py-5 bg-slate-900 text-white rounded-[2rem] font-black shadow-xl hover:bg-black transition-all">Save Question</button>
+               </form>
+             )}
+
+             {activeTab === 'bulk' && (
+               <div className="space-y-8 animate-in fade-in">
+                  <div className="space-y-2">
+                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Paste Raw Text</label>
+                    <textarea 
+                      className="w-full p-8 bg-slate-50 rounded-[2.5rem] border-2 border-slate-100 font-bold h-64 outline-none focus:border-blue-500 transition-colors"
+                      placeholder="Paste multiple questions. Separate questions with double new lines..."
+                      value={formData.questionText}
+                      onChange={e => setFormData({...formData, questionText: e.target.value})}
+                    />
+                  </div>
+                  <button onClick={handleBulkIngestHindi} disabled={isProcessing} className="w-full py-5 bg-blue-600 text-white rounded-[2rem] font-black shadow-xl hover:bg-blue-700 transition-all disabled:opacity-50">
+                    {isProcessing ? 'Processing Batches...' : 'Run Bulk AI Import'}
+                  </button>
+               </div>
+             )}
+
+             {activeTab === 'pdf' && (
+               <div className="space-y-8 animate-in fade-in">
+                  <div 
+                    onClick={() => fileInputRef.current?.click()}
+                    className={`relative border-4 border-dashed rounded-[3rem] p-16 text-center transition-all cursor-pointer ${pdfFile ? 'border-emerald-200 bg-emerald-50' : 'border-slate-100 bg-slate-50 hover:bg-slate-100 hover:border-slate-200'}`}
+                  >
+                    <input type="file" ref={fileInputRef} className="hidden" accept="application/pdf" onChange={e => setPdfFile(e.target.files?.[0] || null)} />
+                    <div className="space-y-4">
+                      <div className={`w-20 h-20 mx-auto rounded-3xl flex items-center justify-center shadow-lg transition-colors ${pdfFile ? 'bg-emerald-500 text-white' : 'bg-white text-slate-400'}`}>
+                        <svg className="w-10 h-10" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z" /></svg>
+                      </div>
+                      <div className="space-y-1">
+                        <h4 className="text-xl font-black text-slate-900">{pdfFile ? pdfFile.name : "Select Exam PDF Book"}</h4>
+                        <p className="text-slate-500 font-bold text-sm">{pdfFile ? `${(pdfFile.size/1024/1024).toFixed(2)} MB • Ready to scan` : "AI will scan the layout and extract questions automatically"}</p>
+                      </div>
                     </div>
-                  </>
-                )}
-
-                <div className="pt-6 flex justify-end gap-6">
-                   <button type="button" onClick={() => { setFormData({...formData, questionText: '', options: {A:'',B:'',C:'',D:''}}); setHindiError(null); setIngestionSummary(null); }} className="text-slate-400 font-black text-xs uppercase tracking-widest hover:text-rose-500">Reset</button>
-                   {isBulkMode ? (
-                     <button type="button" onClick={handleBulkIngestHindi} disabled={isProcessing} className="px-12 py-5 bg-slate-900 text-white rounded-[2rem] font-black shadow-2xl disabled:opacity-50">
-                        {isProcessing ? 'Ingesting...' : 'Start Bulk Process'}
-                     </button>
-                   ) : (
-                     <button type="submit" className="px-12 py-5 bg-orange-600 text-white rounded-[2rem] font-black shadow-2xl">Save Single</button>
-                   )}
-                </div>
-             </form>
+                  </div>
+                  <button 
+                    onClick={handlePDFIngest} 
+                    disabled={!pdfFile || isProcessing} 
+                    className="w-full py-5 bg-purple-600 text-white rounded-[2rem] font-black shadow-xl hover:bg-purple-700 transition-all disabled:opacity-50 flex items-center justify-center gap-3"
+                  >
+                    {isProcessing ? (
+                      <>
+                        <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+                        Scanning Document...
+                      </>
+                    ) : 'Start Smart PDF Extraction'}
+                  </button>
+               </div>
+             )}
           </div>
 
-          {ingestionSummary && (
-            <div className="space-y-8 animate-in slide-in-from-bottom-10">
-               <div className="bg-slate-900 p-10 rounded-[3.5rem] text-white flex items-center justify-between gap-10 shadow-2xl relative overflow-hidden">
-                  <div className="relative z-10 space-y-2">
-                     <h3 className="text-3xl font-black tracking-tight">Process Result</h3>
-                     <p className="text-slate-400 font-bold">Consolidated report.</p>
+          {failedBatches.length > 0 && (
+            <div className="bg-rose-50 p-10 rounded-[3rem] border-2 border-rose-100 space-y-4 animate-in slide-in-from-bottom-6">
+              <h3 className="text-lg font-black text-rose-800 uppercase tracking-widest flex items-center gap-2">
+                <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 20 20"><path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7 4a1 1 0 11-2 0 1 1 0 012 0zm-1-9a1 1 0 00-1 1v4a1 1 0 102 0V6a1 1 0 00-1-1z" clipRule="evenodd" /></svg>
+                Failed Items ({failedBatches.length})
+              </h3>
+              <div className="grid grid-cols-1 gap-3">
+                {failedBatches.map((fb, i) => (
+                  <div key={i} className="bg-white p-5 rounded-2xl border border-rose-100 text-xs font-bold text-slate-600">
+                    Batch #{fb.chunkIndex}: {fb.error}
                   </div>
-                  <div className="relative z-10 flex gap-8">
-                     <div className="text-center">
-                        <div className="text-3xl font-black text-emerald-400">{ingestionSummary.accepted}</div>
-                        <div className="text-[8px] font-black uppercase text-slate-500 mt-1">Accepted</div>
-                     </div>
-                     <div className="text-center">
-                        <div className="text-3xl font-black text-rose-500">{ingestionSummary.rejected}</div>
-                        <div className="text-[8px] font-black uppercase text-slate-500 mt-1">Rejected</div>
-                     </div>
-                  </div>
-                  {ingestionSummary.accepted > 0 && (
-                    <button onClick={importAll} className="relative z-10 px-10 py-5 bg-emerald-500 text-slate-900 rounded-[2rem] font-black">Import All</button>
-                  )}
-               </div>
-
-               <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
-                  {extractedQuestions.map((q, idx) => (
-                    <div key={idx} className="bg-white p-10 rounded-[3rem] border border-slate-100 shadow-xl space-y-8 flex flex-col h-full group hover:border-orange-200 transition">
-                       <div className="flex justify-between items-center">
-                          <span className="text-[10px] font-black text-indigo-600 uppercase tracking-widest">{q.subject}</span>
-                          <span className={`px-4 py-1 rounded-xl text-[9px] font-black uppercase tracking-widest ${q.difficulty === Difficulty.EASY ? 'bg-emerald-50 text-emerald-600' : q.difficulty === Difficulty.MEDIUM ? 'bg-amber-50 text-amber-600' : 'bg-rose-50 text-rose-600'}`}>
-                            {q.difficulty}
-                          </span>
-                       </div>
-                       <p className="text-lg font-bold text-slate-900 leading-snug flex-1">{q.questionText}</p>
-                       <div className="pt-6 border-t border-slate-50 flex justify-between items-center">
-                          <button onClick={() => setExtractedQuestions(prev => prev.filter((_, i) => i !== idx))} className="text-xs font-black text-slate-300 hover:text-rose-500">Discard</button>
-                          <button onClick={() => importSingle(idx)} className="px-8 py-3 bg-slate-900 text-white rounded-2xl font-black text-xs">Import</button>
-                       </div>
-                    </div>
-                  ))}
-               </div>
+                ))}
+              </div>
             </div>
           )}
         </div>
 
         <div className="lg:col-span-4">
-           <div className="bg-white p-10 rounded-[4rem] border border-slate-100 shadow-2xl h-[1000px] flex flex-col sticky top-24">
-              <h4 className="text-xl font-black text-slate-900 mb-8 pb-4 border-b border-slate-50">Mock Bank ({questions.length})</h4>
-              <div className="flex-1 overflow-y-auto space-y-4 pr-2 custom-scrollbar">
-                 {questions.map((q) => (
-                   <div key={q.id} className="p-6 bg-slate-50/50 rounded-3xl border border-slate-50 group relative">
-                      <div className="flex justify-between items-start">
-                         <span className="text-[8px] font-black text-slate-400 uppercase tracking-widest">{q.subject}</span>
-                         <button onClick={() => deleteQuestion(q.id)} className="opacity-0 group-hover:opacity-100 text-rose-600">
-                            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
-                         </button>
-                      </div>
-                      <p className="text-xs font-bold text-slate-700 line-clamp-2">{q.questionText}</p>
-                   </div>
-                 ))}
-              </div>
-           </div>
+          <div className="bg-white p-8 rounded-[3rem] border border-slate-100 shadow-xl sticky top-24">
+            <div className="flex items-center justify-between mb-8">
+              <h3 className="text-xl font-black text-slate-900 tracking-tight">Question Bank</h3>
+              <span className="px-4 py-1.5 bg-blue-50 text-blue-600 rounded-xl text-sm font-black">{questions.length}</span>
+            </div>
+            <div className="space-y-3 max-h-[700px] overflow-y-auto pr-2 custom-scrollbar">
+              {questions.map(q => (
+                <div key={q.id} className="p-4 bg-slate-50/50 rounded-2xl border border-slate-100 group transition-all hover:bg-white hover:shadow-lg">
+                  <div className="flex justify-between items-start gap-4">
+                    <p className="text-xs font-bold text-slate-700 line-clamp-2 flex-1">{q.questionText}</p>
+                    <button onClick={() => deleteQuestion(q.id)} className="opacity-0 group-hover:opacity-100 text-rose-400 hover:text-rose-600 transition-opacity">
+                      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
+                    </button>
+                  </div>
+                  <div className="mt-2 flex items-center gap-2">
+                    <span className="text-[8px] font-black text-slate-300 uppercase tracking-widest">{q.subject}</span>
+                    <span className={`w-1.5 h-1.5 rounded-full ${q.difficulty === Difficulty.HARD ? 'bg-rose-400' : q.difficulty === Difficulty.MEDIUM ? 'bg-amber-400' : 'bg-emerald-400'}`}></span>
+                  </div>
+                </div>
+              ))}
+              {questions.length === 0 && (
+                <div className="py-20 text-center text-slate-300 font-bold italic text-sm">Empty Question Set</div>
+              )}
+            </div>
+          </div>
         </div>
       </div>
 
       {isProcessing && (
-        <div className="fixed inset-0 z-[200] bg-slate-950/80 backdrop-blur-xl flex items-center justify-center">
-           <div className="bg-white p-14 rounded-[4rem] text-center space-y-8 animate-in zoom-in-95 shadow-2xl">
-              <div className="w-24 h-24 mx-auto relative">
-                <div className="absolute inset-0 border-8 border-indigo-600 rounded-full border-t-transparent animate-spin"></div>
+        <div className="fixed inset-0 z-[200] bg-slate-950/80 backdrop-blur-xl flex items-center justify-center p-8">
+           <div className="bg-white p-12 rounded-[4rem] text-center max-w-lg w-full space-y-10 animate-in zoom-in-95 shadow-2xl relative overflow-hidden">
+              <div className="absolute top-0 inset-x-0 h-2 bg-gradient-to-r from-blue-500 via-indigo-500 to-purple-600"></div>
+              
+              <div className="relative w-28 h-28 mx-auto">
+                 <div className="absolute inset-0 border-[8px] border-slate-50 rounded-full"></div>
+                 <div className="absolute inset-0 border-[8px] border-blue-600 rounded-full border-t-transparent animate-spin"></div>
+                 <div className="absolute inset-0 flex items-center justify-center font-black text-blue-600 text-lg">
+                    {activeTab === 'pdf' ? 'DOC' : `${Math.round((batchProgress.current/batchProgress.total)*100)}%`}
+                 </div>
               </div>
-              <h3 className="text-3xl font-black text-slate-900">Processing Batches...</h3>
-              <p className="text-slate-500 font-bold">Batch {batchProgress.current} / {batchProgress.total}</p>
+
+              <div className="space-y-3">
+                <h3 className="text-3xl font-black text-slate-900 tracking-tight">
+                  {activeTab === 'pdf' ? 'Analyzing Document' : 'Ingesting Batches'}
+                </h3>
+                <p className="text-slate-500 font-bold">
+                  {activeTab === 'pdf' ? 'Gemini AI is reading your PDF file...' : `Processing section ${batchProgress.current} of ${batchProgress.total}`}
+                </p>
+              </div>
+
+              <div className="p-8 bg-blue-50/50 rounded-[2.5rem] border border-blue-100 flex flex-col items-center gap-2">
+                 <div className="text-blue-600 font-black text-5xl">{batchProgress.saved}</div>
+                 <div className="text-[10px] font-black text-blue-400 uppercase tracking-[0.2em]">Questions Synced Securely</div>
+              </div>
+
+              <div className="text-[10px] font-black text-slate-400 uppercase tracking-widest animate-pulse">
+                System Active • Atomic Save Enabled
+              </div>
            </div>
         </div>
       )}
