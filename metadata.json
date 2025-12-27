@@ -1,0 +1,7 @@
+{
+  "name": "Daily Exam Prep Pro",
+  "description": "A comprehensive competitive exam preparation platform featuring syllabus tracking, synchronized progress across exams, and automated mock tests.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
