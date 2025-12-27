@@ -29,7 +29,11 @@ const TRANSLATIONS = {
     systemSynced: "System Synced",
     motivationLabel: "TODAY'S MOTIVATION",
     letGoBtn: "Let's Go!",
-    refreshMotivation: "Refresh Motivation & Target"
+    refreshMotivation: "Refresh Motivation & Target",
+    recentHistory: "Recent Mock History",
+    noHistory: "No mocks attempted yet. Start your journey!",
+    score: "Score",
+    revisit: "Review"
   },
   [Language.HINDI]: {
     dashboard: "डैशबोर्ड",
@@ -44,7 +48,11 @@ const TRANSLATIONS = {
     systemSynced: "सिस्टम सिंक है",
     motivationLabel: "आज का मोटिवेशन",
     letGoBtn: "चलिए शुरू करते हैं!",
-    refreshMotivation: "मोटिवेशन और लक्ष्य बदलें"
+    refreshMotivation: "मोटिवेशन और लक्ष्य बदलें",
+    recentHistory: "हालिया मॉक इतिहास",
+    noHistory: "अभी तक कोई मॉक नहीं दिया गया। शुरू करें!",
+    score: "स्कोर",
+    revisit: "समीक्षा"
   },
   [Language.BHOJPURI_ENGLISH]: {
     dashboard: "Dashboard (खाता-बही)",
@@ -59,18 +67,30 @@ const TRANSLATIONS = {
     systemSynced: "सब सिंक बा",
     motivationLabel: "आज के मोटिवेशन",
     letGoBtn: "चलीं शुरू कइल जाव!",
-    refreshMotivation: "नया मोटिवेशन देखीं"
+    refreshMotivation: "नया मोटिवेशन देखीं",
+    recentHistory: "पिछला मॉक रिजल्ट (History)",
+    noHistory: "अभी तक एगो भी मॉक नईखे भईल।",
+    score: "नंबर",
+    revisit: "फिर से देखीं"
   }
 };
 
 const Dashboard: React.FC = () => {
-  const { exams, subjects, user, language } = useApp();
+  const { exams, subjects, user, language, completedMocks, bestScores } = useApp();
   const [started, setStarted] = useState(false);
   const [showingBriefing, setShowingBriefing] = useState(false);
   const [currentShayari, setCurrentShayari] = useState("");
   const [currentTarget, setCurrentTarget] = useState({ subject: "", topic: "" });
 
   const t = TRANSLATIONS[language];
+
+  const recentMocks = useMemo(() => {
+    return completedMocks.slice(-3).reverse().map(id => ({
+      id,
+      score: bestScores[id],
+      name: id.split('-').map(word => word.charAt(0).toUpperCase() + word.slice(1)).join(' ')
+    }));
+  }, [completedMocks, bestScores]);
 
   const generateDailyBriefing = useCallback(() => {
     const randomShayari = BHOJPURI_SHAYARIS[Math.floor(Math.random() * BHOJPURI_SHAYARIS.length)];
@@ -210,6 +230,46 @@ const Dashboard: React.FC = () => {
           </div>
         </div>
       </header>
+
+      {/* History / Previous Mocks Hub */}
+      <section className="space-y-6">
+        <div className="flex items-center justify-between px-2">
+          <h3 className="text-xl font-black text-slate-900 uppercase tracking-widest flex items-center gap-3">
+             <div className="w-2 h-6 bg-blue-600 rounded-full"></div>
+             {t.recentHistory}
+          </h3>
+        </div>
+        
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+          {recentMocks.length > 0 ? (
+            recentMocks.map((mock) => (
+              <Link 
+                key={mock.id}
+                to={`/mock/${mock.id}`} 
+                className="bg-white p-6 rounded-[2.5rem] border border-slate-100 shadow-xl flex items-center justify-between group hover:border-blue-200 transition-all"
+              >
+                <div className="space-y-1">
+                  <div className="text-[9px] font-black text-slate-400 uppercase tracking-widest">Previous Result</div>
+                  <div className="text-sm font-black text-slate-800 truncate max-w-[150px]">{mock.name}</div>
+                </div>
+                <div className="flex items-center gap-4">
+                  <div className="text-right">
+                    <div className="text-[9px] font-black text-blue-600 uppercase tracking-widest">{t.score}</div>
+                    <div className="text-xl font-black text-slate-900">{mock.score}%</div>
+                  </div>
+                  <div className="w-10 h-10 rounded-xl bg-slate-50 text-slate-400 group-hover:bg-blue-600 group-hover:text-white flex items-center justify-center transition-all">
+                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M9 5l7 7-7 7" /></svg>
+                  </div>
+                </div>
+              </Link>
+            ))
+          ) : (
+            <div className="col-span-full py-10 text-center glass rounded-[2.5rem] border-slate-100">
+              <p className="text-slate-400 font-bold italic">{t.noHistory}</p>
+            </div>
+          )}
+        </div>
+      </section>
 
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
         {exams.map((exam, idx) => {
