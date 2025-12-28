@@ -1,5 +1,5 @@
 
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useMemo } from 'react';
 import { useApp } from '../store';
 import { Difficulty, Question } from '../types';
 import { GoogleGenAI, Type } from "@google/genai";
@@ -14,10 +14,18 @@ const AdminPanel: React.FC = () => {
   const { questions, addQuestion, deleteQuestion, subjects } = useApp();
   const [activeTab, setActiveTab] = useState<'manual' | 'bulk' | 'pdf'>('manual');
   const [isProcessing, setIsProcessing] = useState(false);
+  const [isWaiting, setIsWaiting] = useState(false);
+  const [waitTimer, setWaitTimer] = useState(0);
   const [batchProgress, setBatchProgress] = useState({ current: 0, total: 0, saved: 0 });
   const [failedBatches, setFailedBatches] = useState<FailedBatch[]>([]);
   const [adminError, setAdminError] = useState<string | null>(null);
   const [pdfFile, setPdfFile] = useState<File | null>(null);
+
+  // Filter States
+  const [filterExam, setFilterExam] = useState('All');
+  const [filterSubject, setFilterSubject] = useState('All');
+  const [filterDifficulty, setFilterDifficulty] = useState('All');
+  const [filterTopic, setFilterTopic] = useState('All');
 
   const [formData, setFormData] = useState<Omit<Question, 'id'>>({
     examName: 'UP Police Computer Operator',
@@ -34,7 +42,67 @@ const AdminPanel: React.FC = () => {
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  // Derived unique filter options
+  const uniqueExams = useMemo(() => ['All', ...new Set(questions.map(q => q.examName))], [questions]);
+  const uniqueSubjects = useMemo(() => ['All', ...new Set(questions.map(q => q.subject))], [questions]);
+  const uniqueTopics = useMemo(() => ['All', ...new Set(questions.map(q => q.topic))], [questions]);
+
+  const filteredQuestions = useMemo(() => {
+    return questions.filter(q => {
+      const matchExam = filterExam === 'All' || q.examName === filterExam;
+      const matchSub = filterSubject === 'All' || q.subject === filterSubject;
+      const matchDiff = filterDifficulty === 'All' || q.difficulty === filterDifficulty;
+      const matchTopic = filterTopic === 'All' || q.topic === filterTopic;
+      return matchExam && matchSub && matchDiff && matchTopic;
+    });
+  }, [questions, filterExam, filterSubject, filterDifficulty, filterTopic]);
+
   const wait = (ms: number) => new Promise(res => setTimeout(res, ms));
+
+  /**
+   * Helper to check for duplicates
+   */
+  const isDuplicate = (text: string) => {
+    const normalized = text.trim().toLowerCase();
+    return questions.some(q => q.questionText.trim().toLowerCase() === normalized);
+  };
+
+  /**
+   * Enhanced API call wrapper with Exponential Backoff and 429 handling
+   */
+  const callWithRetry = async (fn: () => Promise<any>, maxRetries = 3): Promise<any> => {
+    let attempt = 0;
+    while (attempt < maxRetries) {
+      try {
+        return await fn();
+      } catch (error: any) {
+        const errorMsg = error.message || "";
+        const isRateLimit = errorMsg.includes("429") || errorMsg.includes("RESOURCE_EXHAUSTED");
+        
+        if (isRateLimit && attempt < maxRetries - 1) {
+          attempt++;
+          const retrySecondsMatch = errorMsg.match(/retry in (\d+\.?\d*)s/);
+          let delay = retrySecondsMatch ? (parseFloat(retrySecondsMatch[1]) + 1) * 1000 : Math.pow(2, attempt) * 2000;
+          
+          setIsWaiting(true);
+          let remaining = Math.ceil(delay / 1000);
+          setWaitTimer(remaining);
+          
+          const countdown = setInterval(() => {
+            remaining--;
+            setWaitTimer(remaining);
+            if (remaining <= 0) clearInterval(countdown);
+          }, 1000);
+
+          await wait(delay);
+          clearInterval(countdown);
+          setIsWaiting(false);
+          continue;
+        }
+        throw error;
+      }
+    }
+  };
 
   const fileToBase64 = (file: File): Promise<string> => {
     return new Promise((resolve, reject) => {
@@ -89,7 +157,7 @@ const AdminPanel: React.FC = () => {
         required: ["questions"]
       };
 
-      const response = await ai.models.generateContent({
+      const response = await callWithRetry(() => ai.models.generateContent({
         model: 'gemini-3-flash-preview',
         contents: [
           {
@@ -109,13 +177,18 @@ const AdminPanel: React.FC = () => {
           responseMimeType: "application/json",
           responseSchema: schema
         }
-      });
+      }));
 
       const data = JSON.parse(response.text || '{"questions":[]}');
       let savedCount = 0;
+      let skippedCount = 0;
 
       if (data.questions && data.questions.length > 0) {
         data.questions.forEach((q: any) => {
+          if (isDuplicate(q.questionText)) {
+            skippedCount++;
+            return;
+          }
           addQuestion({
             examName: formData.examName,
             subject: formData.subject,
@@ -131,12 +204,11 @@ const AdminPanel: React.FC = () => {
           savedCount++;
         });
         setBatchProgress(prev => ({ ...prev, saved: savedCount }));
-        alert(`Successfully imported ${savedCount} questions from PDF!`);
+        alert(`Finished: Imported ${savedCount} questions. Skipped ${skippedCount} duplicates.`);
         setPdfFile(null);
       } else {
         throw new Error("No questions could be extracted from this document.");
       }
-
     } catch (error: any) {
       console.error("PDF Extraction Error:", error);
       setAdminError(`❌ PDF Error: ${error.message || "Failed to parse document"}`);
@@ -151,7 +223,21 @@ const AdminPanel: React.FC = () => {
       return;
     }
 
-    const chunks = formData.questionText.split('\n\n').filter(c => c.trim().length > 10);
+    const lines = formData.questionText.split('\n').filter(l => l.trim().length > 0);
+    const BATCH_SIZE_CHARS = 3000;
+    const chunks: string[] = [];
+    let currentChunk = "";
+
+    lines.forEach(line => {
+      if ((currentChunk.length + line.length) > BATCH_SIZE_CHARS) {
+        chunks.push(currentChunk);
+        currentChunk = line;
+      } else {
+        currentChunk += "\n" + line;
+      }
+    });
+    if (currentChunk) chunks.push(currentChunk);
+
     setIsProcessing(true);
     setFailedBatches([]);
     setBatchProgress({ current: 0, total: chunks.length, saved: 0 });
@@ -189,33 +275,64 @@ const AdminPanel: React.FC = () => {
     };
 
     let totalSaved = 0;
+    let skippedTotal = 0;
+
     for (let i = 0; i < chunks.length; i++) {
       setBatchProgress(prev => ({ ...prev, current: i + 1 }));
       try {
-        const response = await ai.models.generateContent({
+        const response = await callWithRetry(() => ai.models.generateContent({
           model: 'gemini-3-flash-preview',
-          contents: `Ingest these questions:\n${chunks[i]}`,
+          contents: `I have a block of text containing multiple choice questions. Please identify and extract every single question from the following text block. 
+          Important: 
+          - Keep the original Hindi/English text exactly as is.
+          - If a question is missing options or an answer, skip it.
+          - Assign metadata: ${formData.examName}, Subject: ${formData.subject}.
+          
+          TEXT BLOCK:
+          ${chunks[i]}`,
           config: { responseMimeType: "application/json", responseSchema: schema }
-        });
+        }));
+        
         const data = JSON.parse(response.text || '{"questions":[]}');
         data.questions?.forEach((q: any) => {
-          addQuestion({ ...formData, ...q, options: { A: q.A, B: q.B, C: q.C, D: q.D } });
+          if (isDuplicate(q.questionText)) {
+            skippedTotal++;
+            return;
+          }
+          addQuestion({ 
+            ...formData, 
+            ...q, 
+            options: { A: q.A, B: q.B, C: q.C, D: q.D },
+            topic: formData.topic || 'Bulk Ingest'
+          });
           totalSaved++;
         });
         setBatchProgress(prev => ({ ...prev, saved: totalSaved }));
-        await wait(500);
+        await wait(200);
       } catch (err: any) {
-        setFailedBatches(p => [...p, { chunkIndex: i + 1, rawText: chunks[i].slice(0, 50), error: err.message }]);
+        setFailedBatches(p => [...p, { chunkIndex: i + 1, rawText: chunks[i].slice(0, 50) + "...", error: err.message }]);
       }
     }
     setIsProcessing(false);
+    if (skippedTotal > 0) alert(`Imported ${totalSaved} questions. Skipped ${skippedTotal} duplicates already in bank.`);
   };
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
+    if (isDuplicate(formData.questionText)) {
+      alert("This exact question text already exists in the bank.");
+      return;
+    }
     addQuestion(formData);
     setFormData({ ...formData, questionText: '', explanation: '', options: { A: '', B: '', C: '', D: '' } });
     alert("Question saved!");
+  };
+
+  const handleClearAll = () => {
+    if (window.confirm("ARE YOU SURE? This will permanently delete all questions from the local bank.")) {
+      questions.forEach(q => deleteQuestion(q.id));
+      alert("Question bank cleared.");
+    }
   };
 
   return (
@@ -288,13 +405,13 @@ const AdminPanel: React.FC = () => {
                     <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Paste Raw Text</label>
                     <textarea 
                       className="w-full p-8 bg-slate-50 rounded-[2.5rem] border-2 border-slate-100 font-bold h-64 outline-none focus:border-blue-500 transition-colors"
-                      placeholder="Paste multiple questions. Separate questions with double new lines..."
+                      placeholder="Paste text from books or websites here. AI will detect and extract questions automatically..."
                       value={formData.questionText}
                       onChange={e => setFormData({...formData, questionText: e.target.value})}
                     />
                   </div>
-                  <button onClick={handleBulkIngestHindi} disabled={isProcessing} className="w-full py-5 bg-blue-600 text-white rounded-[2rem] font-black shadow-xl hover:bg-blue-700 transition-all disabled:opacity-50">
-                    {isProcessing ? 'Processing Batches...' : 'Run Bulk AI Import'}
+                  <button onClick={handleBulkIngestHindi} disabled={isProcessing} className="w-full py-5 bg-blue-600 text-white rounded-[2rem] font-black shadow-xl hover:bg-blue-700 transition-all disabled:opacity-50 flex items-center justify-center gap-3">
+                    {isProcessing ? 'Optimizing Batches...' : 'Run Smart Bulk AI Import'}
                   </button>
                </div>
              )}
@@ -349,14 +466,48 @@ const AdminPanel: React.FC = () => {
           )}
         </div>
 
-        <div className="lg:col-span-4">
-          <div className="bg-white p-8 rounded-[3rem] border border-slate-100 shadow-xl sticky top-24">
-            <div className="flex items-center justify-between mb-8">
+        <div className="lg:col-span-4 space-y-6">
+          <div className="bg-white p-8 rounded-[3rem] border border-slate-100 shadow-xl sticky top-24 space-y-6 overflow-hidden">
+            <div className="flex items-center justify-between">
               <h3 className="text-xl font-black text-slate-900 tracking-tight">Question Bank</h3>
-              <span className="px-4 py-1.5 bg-blue-50 text-blue-600 rounded-xl text-sm font-black">{questions.length}</span>
+              <div className="flex gap-2">
+                <button onClick={handleClearAll} className="p-2 text-rose-400 hover:text-rose-600 transition-colors" title="Clear All Questions">
+                   <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
+                </button>
+                <span className="px-4 py-1.5 bg-blue-50 text-blue-600 rounded-xl text-sm font-black">{questions.length}</span>
+              </div>
             </div>
-            <div className="space-y-3 max-h-[700px] overflow-y-auto pr-2 custom-scrollbar">
-              {questions.map(q => (
+
+            {/* Filtering Controls */}
+            <div className="p-5 bg-slate-50 rounded-[2rem] space-y-4 border border-slate-100">
+               <div className="text-[9px] font-black text-slate-400 uppercase tracking-[0.2em]">Filter Results</div>
+               <div className="grid grid-cols-1 gap-3">
+                  <select value={filterExam} onChange={e => setFilterExam(e.target.value)} className="w-full p-2.5 bg-white rounded-xl border border-slate-200 text-xs font-bold">
+                    {uniqueExams.map(ex => <option key={ex} value={ex}>{ex === 'All' ? 'All Exams' : ex}</option>)}
+                  </select>
+                  <select value={filterSubject} onChange={e => setFilterSubject(e.target.value)} className="w-full p-2.5 bg-white rounded-xl border border-slate-200 text-xs font-bold">
+                    {uniqueSubjects.map(s => <option key={s} value={s}>{s === 'All' ? 'All Subjects' : s}</option>)}
+                  </select>
+                  <select value={filterDifficulty} onChange={e => setFilterDifficulty(e.target.value)} className="w-full p-2.5 bg-white rounded-xl border border-slate-200 text-xs font-bold">
+                    <option value="All">All Difficulties</option>
+                    <option value={Difficulty.EASY}>Easy</option>
+                    <option value={Difficulty.MEDIUM}>Medium</option>
+                    <option value={Difficulty.HARD}>Hard</option>
+                  </select>
+                  <select value={filterTopic} onChange={e => setFilterTopic(e.target.value)} className="w-full p-2.5 bg-white rounded-xl border border-slate-200 text-xs font-bold">
+                    {uniqueTopics.map(t => <option key={t} value={t}>{t === 'All' ? 'All Topics' : t}</option>)}
+                  </select>
+               </div>
+               {(filterExam !== 'All' || filterSubject !== 'All' || filterDifficulty !== 'All' || filterTopic !== 'All') && (
+                 <button onClick={() => {setFilterExam('All'); setFilterSubject('All'); setFilterDifficulty('All'); setFilterTopic('All');}} className="w-full py-2 bg-white text-blue-600 rounded-xl text-[10px] font-black uppercase tracking-widest border border-blue-100">Reset Filters</button>
+               )}
+            </div>
+
+            <div className="space-y-3 max-h-[400px] overflow-y-auto pr-2 custom-scrollbar">
+              <div className="text-[10px] font-black text-slate-400 px-2 flex justify-between">
+                <span>Showing {filteredQuestions.length} Items</span>
+              </div>
+              {filteredQuestions.map(q => (
                 <div key={q.id} className="p-4 bg-slate-50/50 rounded-2xl border border-slate-100 group transition-all hover:bg-white hover:shadow-lg">
                   <div className="flex justify-between items-start gap-4">
                     <p className="text-xs font-bold text-slate-700 line-clamp-2 flex-1">{q.questionText}</p>
@@ -364,14 +515,17 @@ const AdminPanel: React.FC = () => {
                       <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
                     </button>
                   </div>
-                  <div className="mt-2 flex items-center gap-2">
-                    <span className="text-[8px] font-black text-slate-300 uppercase tracking-widest">{q.subject}</span>
-                    <span className={`w-1.5 h-1.5 rounded-full ${q.difficulty === Difficulty.HARD ? 'bg-rose-400' : q.difficulty === Difficulty.MEDIUM ? 'bg-amber-400' : 'bg-emerald-400'}`}></span>
+                  <div className="mt-2 flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <span className="text-[8px] font-black text-slate-300 uppercase tracking-widest">{q.subject}</span>
+                      <span className={`w-1.5 h-1.5 rounded-full ${q.difficulty === Difficulty.HARD ? 'bg-rose-400' : q.difficulty === Difficulty.MEDIUM ? 'bg-amber-400' : 'bg-emerald-400'}`}></span>
+                    </div>
+                    <span className="text-[7px] font-bold text-slate-400 truncate max-w-[80px]">{q.topic}</span>
                   </div>
                 </div>
               ))}
-              {questions.length === 0 && (
-                <div className="py-20 text-center text-slate-300 font-bold italic text-sm">Empty Question Set</div>
+              {filteredQuestions.length === 0 && (
+                <div className="py-20 text-center text-slate-300 font-bold italic text-sm">No matching questions</div>
               )}
             </div>
           </div>
@@ -385,28 +539,38 @@ const AdminPanel: React.FC = () => {
               
               <div className="relative w-28 h-28 mx-auto">
                  <div className="absolute inset-0 border-[8px] border-slate-50 rounded-full"></div>
-                 <div className="absolute inset-0 border-[8px] border-blue-600 rounded-full border-t-transparent animate-spin"></div>
-                 <div className="absolute inset-0 flex items-center justify-center font-black text-blue-600 text-lg">
-                    {activeTab === 'pdf' ? 'DOC' : `${Math.round((batchProgress.current/batchProgress.total)*100)}%`}
-                 </div>
+                 {isWaiting ? (
+                   <div className="absolute inset-0 flex items-center justify-center">
+                     <div className="text-4xl font-black text-rose-500 animate-pulse">{waitTimer}</div>
+                   </div>
+                 ) : (
+                   <>
+                    <div className="absolute inset-0 border-[8px] border-blue-600 rounded-full border-t-transparent animate-spin"></div>
+                    <div className="absolute inset-0 flex items-center justify-center font-black text-blue-600 text-lg">
+                        {activeTab === 'pdf' ? 'DOC' : `${Math.round((batchProgress.current/batchProgress.total)*100)}%`}
+                    </div>
+                   </>
+                 )}
               </div>
 
               <div className="space-y-3">
-                <h3 className="text-3xl font-black text-slate-900 tracking-tight">
-                  {activeTab === 'pdf' ? 'Analyzing Document' : 'Ingesting Batches'}
+                <h3 className={`text-3xl font-black tracking-tight ${isWaiting ? 'text-rose-600' : 'text-slate-900'}`}>
+                  {isWaiting ? 'Cooling Down...' : (activeTab === 'pdf' ? 'Analyzing Document' : 'Syncing Data')}
                 </h3>
                 <p className="text-slate-500 font-bold">
-                  {activeTab === 'pdf' ? 'Gemini AI is reading your PDF file...' : `Processing section ${batchProgress.current} of ${batchProgress.total}`}
+                  {isWaiting 
+                    ? `Rate limit hit. Resuming in ${waitTimer} seconds automatically...` 
+                    : (activeTab === 'pdf' ? 'Gemini AI is reading your PDF file...' : `Processing section ${batchProgress.current} of ${batchProgress.total}`)}
                 </p>
               </div>
 
-              <div className="p-8 bg-blue-50/50 rounded-[2.5rem] border border-blue-100 flex flex-col items-center gap-2">
-                 <div className="text-blue-600 font-black text-5xl">{batchProgress.saved}</div>
-                 <div className="text-[10px] font-black text-blue-400 uppercase tracking-[0.2em]">Questions Synced Securely</div>
+              <div className={`p-8 rounded-[2.5rem] border flex flex-col items-center gap-2 transition-colors ${isWaiting ? 'bg-rose-50 border-rose-100' : 'bg-blue-50/50 border-blue-100'}`}>
+                 <div className={`font-black text-5xl ${isWaiting ? 'text-rose-600' : 'text-blue-600'}`}>{batchProgress.saved}</div>
+                 <div className={`text-[10px] font-black uppercase tracking-[0.2em] ${isWaiting ? 'text-rose-400' : 'text-blue-400'}`}>Questions Extracted & Saved</div>
               </div>
 
               <div className="text-[10px] font-black text-slate-400 uppercase tracking-widest animate-pulse">
-                System Active • Atomic Save Enabled
+                Cloud Sync Active • {isWaiting ? 'Paused for Rate Limit' : 'Atomic Save Enabled'}
               </div>
            </div>
         </div>
